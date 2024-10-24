@@ -9,6 +9,7 @@ import (
 	"url-shortener/database"
 	"url-shortener/models"
 
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/go-redis/redis/v8"
 )
@@ -16,8 +17,8 @@ import (
 Kısaltılmış URL'ler belirlenen bir zamanda geçerli olmalıdır. Bu süre sonunda kısaltılmış URL'lerin
 kullanılabilirliği sona ermelidir. (redis kullanılabilir, ttl kavramı incelenmeli) Bu değer environment içerisinden değiştirilebilmelidir.
 2. Süre bittikten sonra URL kullanılamasa bile istatistiklere ulaşabilmek için saklanmalıdır.
-*/
 
+*/
 // 1- delete yaptığında deleted_at kısmını doldur
 // 2-  ekleme işleminde postgrede kayı  zaten varsa güncelleme yapmamız lazım
 // ttl süresi dolduğunda redisten silinen verinin ilgili postgre şeysi tetikleniyor mu kontrol et
@@ -47,13 +48,16 @@ func generateShortURL() string {
 	}
 }
 const (
-	ActiveTime = 5 * time.Minute // 5 yazan kısım .env den çekliecek
+    // sonra .env'den ACTIVE_TIME_MINUTE değerini çek
+    ActiveTime = 1 * time.Minute
 )
+
+
 func ShortenURL(c *fiber.Ctx) error {
-    // İstek gövdesini ayrıştır
     type Request struct {
         OriginalURL string `json:"original_url" binding:"required"`
     }
+
     var body Request
     if err := c.BodyParser(&body); err != nil {
         return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -61,19 +65,15 @@ func ShortenURL(c *fiber.Ctx) error {
         })
     }
 
-    // Benzersiz kısaltılmış URL üret
-    shortURL := generateShortURL()
-
-    // Veritabanında aynı original_url var mı kontrol et
+    // Orijinal URL veritabanında var mı kontrol et.
     var existingURL models.URL
     result := database.DB.Where("original_url = ?", body.OriginalURL).First(&existingURL)
 
     if result.Error == nil {
-        // Redis'te shortURL kayıtlı mı kontrol et
+        // Redis'te shortURL var mı kontrol et.
         redisValue, err := database.RedisClient.Get(database.Ctx, existingURL.ShortURL).Result()
-
         if err == nil && redisValue == body.OriginalURL {
-            // Hem veritabanında hem de Redis'te mevcut
+            // Hem veritabanında hem Redis'te mevcutsa yanıt döndür.
             return c.Status(fiber.StatusConflict).JSON(fiber.Map{
                 "message":     "This URL has already been shortened",
                 "short_url":   existingURL.ShortURL,
@@ -82,10 +82,43 @@ func ShortenURL(c *fiber.Ctx) error {
                 "usage_count": existingURL.UsageCount,
             })
         }
+
+        // Orijinal URL veritabanında var, alanları güncelle.
+        existingURL.ShortURL = generateShortURL()
+        existingURL.CreatedAt = time.Now()
+        existingURL.ExpiresAt = time.Now().Add(ActiveTime)
+        existingURL.UsageCount = 0
+
+        // Güncellenen URL'yi kaydet.
+        if err := database.DB.Save(&existingURL).Error; err != nil {
+            return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+                "error": "Failed to update URL",
+            })
+        }
+
+        // Redis'e TTL ile güncelle.
+        err = database.RedisClient.Set(database.Ctx, existingURL.ShortURL, body.OriginalURL, ActiveTime).Err()
+        if err != nil {
+            return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+                "error": "Failed to update Redis",
+            })
+        }
+
+        // Yanıt döndür.
+        return c.Status(fiber.StatusOK).JSON(fiber.Map{
+            "message":     "URL updated successfully",
+            "short_url":   "http://localhost:3000/" + existingURL.ShortURL,
+            "created_at":  existingURL.CreatedAt,
+            "expires_at":  existingURL.ExpiresAt,
+            "usage_count": existingURL.UsageCount,
+        })
     }
 
-    // Yeni URL oluşturma veya güncelleme işlemi
-    url := models.URL{
+    // Yeni bir kısa URL oluştur.
+    shortURL := generateShortURL()
+
+    // Yeni URL kaydını oluştur.
+    newURL := models.URL{
         OriginalURL: body.OriginalURL,
         ShortURL:    shortURL,
         CreatedAt:   time.Now(),
@@ -93,14 +126,14 @@ func ShortenURL(c *fiber.Ctx) error {
         UsageCount:  0,
     }
 
-    // Veritabanına kaydet
-    if err := database.DB.Save(&url).Error; err != nil {
+    // Veritabanına kaydet.
+    if err := database.DB.Create(&newURL).Error; err != nil {
         return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
             "error": "Failed to save URL",
         })
     }
 
-    // Redis'e TTL ile kaydet
+    // Redis'e TTL ile kaydet.
     err := database.RedisClient.Set(database.Ctx, shortURL, body.OriginalURL, ActiveTime).Err()
     if err != nil {
         return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -108,13 +141,13 @@ func ShortenURL(c *fiber.Ctx) error {
         })
     }
 
-    // JSON yanıtı döndür
+    // JSON yanıtı döndür.
     response := fiber.Map{
-        "created_at":   url.CreatedAt,
-        "original_url": url.OriginalURL,
-        "short_url":    "http://localhost:3000/" + url.ShortURL,
-        "expires_at":   url.ExpiresAt,
-        "usage_count":  url.UsageCount,
+        "message":     "URL shortened successfully",
+        "short_url":   "http://localhost:3000/" + newURL.ShortURL,
+        "created_at":  newURL.CreatedAt,
+        "expires_at":  newURL.ExpiresAt,
+        "usage_count": newURL.UsageCount,
     }
 
     return c.Status(fiber.StatusOK).JSON(response)
@@ -187,9 +220,8 @@ func DeleteShortURL(c *fiber.Ctx) error {
     // Redis'ten shortURL anahtarıyla orijinal URL'yi bul
     originalURL, err := database.RedisClient.Get(database.Ctx, shortURL).Result()
     if err == redis.Nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-            "error": "Redis: Key not found for shortURL",
-        })
+        log.Printf("Redis: Key not found for shortURL: %s", shortURL)
+        originalURL = "" // Redis'te anahtar yoksa boş string olarak ayarla
     } else if err != nil {
         return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
             "error": "Failed to fetch URL from Redis",
