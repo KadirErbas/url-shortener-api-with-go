@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Go dependencies
+/vendor/
+/bin/
+/pkg/
+
+# Environment Variables
+.env
+
+# Binary files
+*.exe
+*.out
+*.dll
+
+# VSCode files
+.vscode/
